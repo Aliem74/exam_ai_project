@@ -1,0 +1,105 @@
+  from langchain_community.vectorstores import Chroma
+  from langchain_community.embeddings import HuggingFaceEmbeddings
+  from langchain.text_splitter import RecursiveCharacterTextSplitter
+  from langchain.schema import Document
+
+  class KnowledgeBaseBuilder:
+      """Builds the vector database from scraped content."""
+
+      def __init__(self, persist_dir: str = "./chroma_db"):
+          # Multilingual embeddings — handles Swedish + English
+          self.embeddings = HuggingFaceEmbeddings(
+              model_name="intfloat/multilingual-e5-large",
+              model_kwargs={"device": "cpu"},
+              encode_kwargs={"normalize_embeddings": True}
+          )
+          self.vectorstore = Chroma(
+              persist_directory=persist_dir,
+              embedding_function=self.embeddings,
+              collection_name="course_knowledge"
+          )
+          self.splitter = RecursiveCharacterTextSplitter(
+              chunk_size=1000,
+              chunk_overlap=200,
+              separators=["\n\n", "\n", ". ", " "]
+          )
+
+      def index_course_objectives(self, course_info: "CourseInfo"):
+          """Index course objectives with rich metadata."""
+          documents = []
+          for obj in course_info.objectives:
+              doc = Document(
+                  page_content=obj.objective_text,
+                  metadata={
+                      "type": "objective",
+                      "course_code": course_info.code,
+                      "course_title": course_info.title,
+                      "bloom_level": obj.bloom_level,
+                      "language": obj.language,
+                      "source_url": obj.source_url
+                  }
+              )
+              documents.append(doc)
+
+          # Also index course content summary
+          if course_info.content_summary:
+              chunks = self.splitter.split_text(course_info.content_summary)
+              for chunk in chunks:
+                  documents.append(Document(
+                      page_content=chunk,
+                      metadata={
+                          "type": "course_content",
+                          "course_code": course_info.code,
+                          "language": course_info.language,
+                          "source_url": course_info.source_url
+                      }
+                  ))
+
+          self.vectorstore.add_documents(documents)
+
+      def index_exam_questions(self, exam_docs: list["ExamDocument"]):
+          """Index past exam questions for reference."""
+          documents = []
+          for exam in exam_docs:
+              for q in exam.questions:
+                  doc = Document(
+                      page_content=q.question_text,
+                      metadata={
+                          "type": "exam_question",
+                          "course_code": q.course_code,
+                          "year": q.year,
+                          "question_number": q.question_number,
+                          "marks": q.marks or 0,
+                          "has_solution": q.model_answer is not None,
+                          "language": q.language,
+                          "source_file": q.source_file
+                      }
+                  )
+                  documents.append(doc)
+
+                  # Index solution separately if available
+                  if q.model_answer:
+                      documents.append(Document(
+                          page_content=q.model_answer,
+                          metadata={
+                              "type": "model_answer",
+                              "course_code": q.course_code,
+                              "year": q.year,
+                              "question_number": q.question_number,
+                              "language": q.language
+                          }
+                      ))
+
+          self.vectorstore.add_documents(documents)
+
+      def retrieve_for_question_gen(
+          self, objective: str, course_code: str, k: int = 5
+      ) -> list[Document]:
+          """Retrieve relevant content for generating a question about an objective."""
+          # Filter by course and get both objectives + exam questions
+          results = self.vectorstore.similarity_search(
+              query=objective,
+              k=k,
+              filter={"course_code": course_code}
+          )
+          return results
