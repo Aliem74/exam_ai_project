@@ -1,0 +1,225 @@
+ import httpx
+  from bs4 import BeautifulSoup
+  from urllib.parse import urljoin
+  import re
+  from dataclasses import dataclass, field
+
+  @dataclass
+  class CourseObjective:
+      code: str                    # e.g., "TIF285"
+      title: str
+      objective_text: str          # The learning outcome
+      bloom_level: str             # Classified Bloom's level
+      language: str                # "sv" or "en"
+      source_url: str
+
+  @dataclass
+  class CourseInfo:
+      code: str
+      title: str
+      credits: float
+      objectives: list[CourseObjective] = field(default_factory=list)
+      content_summary: str = ""
+      examination_format: str = ""
+      language: str = "en"
+      source_url: str = ""
+
+
+  class ChalmersCourseScraper:
+      """
+      Scrapes course objectives from student.chalmers.se.
+
+      Chalmers course pages typically have:
+      - Learning outcomes (Lärandemål / Learning objectives)
+      - Course content
+      - Examination format
+      """
+
+      BASE_URL = "https://www.student.chalmers.se"
+      COURSE_URL_PATTERN = "/sp/course?course_id={code}"
+
+      # Swedish and English section headers for course pages
+      OBJECTIVE_HEADERS = [
+          "learning outcomes", "intended learning outcomes",
+          "lärandemål", "efter avslutad kurs ska studenten kunna",
+          "learning objectives", "intended learning objectives"
+      ]
+
+      def __init__(self, http_client: httpx.AsyncClient = None):
+          self.client = http_client or httpx.AsyncClient(
+              timeout=30.0,
+              headers={
+                  "User-Agent": "Mozilla/5.0 (Educational Research Bot)",
+                  "Accept-Language": "sv,en;q=0.9"
+              },
+              follow_redirects=True
+          )
+
+      async def scrape_course(self, course_code: str) -> CourseInfo:
+          """Scrape all relevant info for a course."""
+          url = self._build_course_url(course_code)
+          response = await self.client.get(url)
+          response.raise_for_status()
+
+          soup = BeautifulSoup(response.text, 'html.parser')
+          language = self._detect_language(soup)
+
+          course_info = CourseInfo(
+              code=course_code,
+              title=self._extract_title(soup),
+              credits=self._extract_credits(soup),
+              language=language,
+              source_url=url
+          )
+
+          # Extract learning outcomes
+          course_info.objectives = self._extract_objectives(soup, course_code, url)
+          course_info.content_summary = self._extract_section(soup, [
+              "content", "course content", "kursinnehåll", "innehåll"
+          ])
+          course_info.examination_format = self._extract_section(soup, [
+              "examination", "examination form", "examinationsform"
+          ])
+
+          return course_info
+
+      def _build_course_url(self, code: str) -> str:
+          """Build the URL for a course page."""
+          return f"{self.BASE_URL}/sp/course?course_id={code}"
+
+      def _detect_language(self, soup: BeautifulSoup) -> str:
+          """Detect if page is in Swedish or English."""
+          html_tag = soup.find('html')
+          if html_tag and html_tag.get('lang'):
+              lang = html_tag['lang'].lower()
+              return 'sv' if 'sv' in lang else 'en'
+
+          # Heuristic: check for common Swedish words
+          text = soup.get_text().lower()
+          swedish_markers = ['kursplan', 'lärandemål', 'efter avslutad', 'högskolepoäng']
+          if any(marker in text for marker in swedish_markers):
+              return 'sv'
+          return 'en'
+
+      def _extract_title(self, soup: BeautifulSoup) -> str:
+          """Extract course title."""
+          # Try common patterns on Chalmers pages
+          h1 = soup.find('h1')
+          if h1:
+              return h1.get_text(strip=True)
+          title_tag = soup.find('title')
+          if title_tag:
+              return title_tag.get_text(strip=True).split('|')[0].strip()
+          return "Unknown"
+
+      def _extract_credits(self, soup: BeautifulSoup) -> float:
+          """Extract ECTS credits."""
+          text = soup.get_text()
+          # Match patterns like "7.5 hp" or "7.5 credits"
+          match = re.search(r'(\d+\.?\d*)\s*(?:hp|credits|hec|ECTS)', text, re.IGNORECASE)
+          return float(match.group(1)) if match else 0.0
+
+      def _extract_objectives(
+          self, soup: BeautifulSoup, course_code: str, url: str
+      ) -> list[CourseObjective]:
+          """Extract learning objectives from the page."""
+          objectives = []
+
+          # Find the objectives section
+          section_text = self._extract_section(soup, self.OBJECTIVE_HEADERS)
+          if not section_text:
+              return objectives
+
+          # Split into individual objectives (often bullet points or numbered)
+          lines = [
+              line.strip() for line in section_text.split('\n')
+              if line.strip() and len(line.strip()) > 10
+          ]
+
+          # Remove header lines
+          lines = [
+              l for l in lines
+              if not any(h in l.lower() for h in self.OBJECTIVE_HEADERS)
+          ]
+
+          language = self._detect_language(soup)
+
+          for line in lines:
+              # Clean up bullet markers
+              clean_line = re.sub(r'^[\-\•\*\d\.]+\s*', '', line)
+              if clean_line:
+                  objectives.append(CourseObjective(
+                      code=course_code,
+                      title="",
+                      objective_text=clean_line,
+                      bloom_level=self._classify_bloom_level(clean_line, language),
+                      language=language,
+                      source_url=url
+                  ))
+
+          return objectives
+
+      def _extract_section(self, soup: BeautifulSoup, headers: list[str]) -> str:
+          """Extract text content under a specific section header."""
+          # Strategy 1: Find heading elements
+          for heading in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5']):
+              heading_text = heading.get_text(strip=True).lower()
+              if any(h in heading_text for h in headers):
+                  # Collect all content until next heading
+                  content = []
+                  sibling = heading.find_next_sibling()
+                  while sibling and sibling.name not in ['h1', 'h2', 'h3', 'h4', 'h5']:
+                      content.append(sibling.get_text(strip=True))
+                      sibling = sibling.find_next_sibling()
+                  return '\n'.join(content)
+
+          # Strategy 2: Look for div/section with matching class or id
+          for element in soup.find_all(['div', 'section']):
+              element_id = (element.get('id', '') + element.get('class', [''])[0]).lower()
+              if any(h.replace(' ', '') in element_id for h in headers):
+                  return element.get_text(strip=True)
+
+          return ""
+
+      def _classify_bloom_level(self, objective: str, language: str) -> str:
+          """Classify objective into Bloom's taxonomy level based on verbs."""
+          objective_lower = objective.lower()
+
+          # Bloom's verbs in English and Swedish
+          bloom_verbs = {
+              "remember": {
+                  "en": ["define", "list", "recall", "identify", "name", "state"],
+                  "sv": ["definiera", "lista", "ange", "identifiera", "namnge"]
+              },
+              "understand": {
+                  "en": ["explain", "describe", "interpret", "summarize", "classify", "compare"],
+                  "sv": ["förklara", "beskriva", "tolka", "sammanfatta", "jämföra", "redogöra"]
+              },
+              "apply": {
+                  "en": ["apply", "calculate", "solve", "use", "implement", "demonstrate"],
+                  "sv": ["tillämpa", "beräkna", "lösa", "använda", "implementera", "genomföra"]
+              },
+              "analyze": {
+                  "en": ["analyze", "differentiate", "examine", "compare", "contrast", "investigate"],
+                  "sv": ["analysera", "undersöka", "skilja", "granska", "jämföra"]
+              },
+              "evaluate": {
+                  "en": ["evaluate", "judge", "justify", "critique", "assess", "argue"],
+                  "sv": ["utvärdera", "bedöma", "motivera", "kritisera", "argumentera"]
+              },
+              "create": {
+                  "en": ["create", "design", "construct", "develop", "formulate", "propose"],
+                  "sv": ["skapa", "konstruera", "utveckla", "formulera", "föreslå", "utforma"]
+              }
+          }
+
+          # Check from highest to lowest level
+          for level in reversed(list(bloom_verbs.keys())):
+              verbs = bloom_verbs[level].get(language, bloom_verbs[level]["en"])
+              if any(verb in objective_lower for verb in verbs):
+                  return level
+
+          return "understand"  # Default
+
+      async def close(self):
+          await self.client.aclose()
