@@ -1,0 +1,102 @@
+  from dataclasses import dataclass
+  from typing import Optional
+
+  @dataclass
+  class GeneratedQuestion:
+      question_text: str
+      source_objective: str          # Which course objective this maps to
+      source_chunks: list[str]       # Exact text chunks used to generate
+      source_urls: list[str]         # Where the material came from
+      confidence_score: float        # LLM self-assessed confidence
+      verified: bool = False         # Post-generation verification flag
+
+  class HallucinationGuard:
+      """Verify generated content against source material."""
+
+      def verify_question(self, question: GeneratedQuestion, knowledge_base) -> bool:
+          """Check that every claim in the question is grounded in sources."""
+
+          # Step 1: Extract factual claims from the question
+          claims = self._extract_claims(question.question_text)
+
+          # Step 2: For each claim, verify against source chunks
+          for claim in claims:
+              if not self._claim_is_supported(claim, question.source_chunks):
+                  question.verified = False
+                  return False
+
+          # Step 3: Cross-check with vector DB (semantic similarity)
+          similarity = knowledge_base.similarity_search(question.question_text, k=3)
+          if similarity[0].score < 0.75:  # Too dissimilar from any source
+              question.verified = False
+              return False
+
+          question.verified = True
+          return True
+
+      def _extract_claims(self, text: str) -> list[str]:
+          """Use LLM to decompose text into atomic factual claims."""
+          prompt = f"""
+          Extract all factual claims from this question.
+          Return each claim on a separate line.
+          Text: {text}
+          """
+          response = self.llm.invoke(prompt)
+          return response.strip().split('\n')
+
+      def _claim_is_supported(self, claim: str, sources: list[str]) -> bool:
+          """Check if a claim is supported by source material."""
+          prompt = f"""
+          Is the following claim supported by the source material?
+          Answer ONLY "SUPPORTED" or "NOT_SUPPORTED".
+
+          Claim: {claim}
+          Source material: {' '.join(sources)}
+          """
+          response = self.llm.invoke(prompt)
+          return "SUPPORTED" in response.upper()
+
+# Constrained Generation Techniques
+
+  # Technique: Force the LLM to quote sources
+  QUESTION_GEN_PROMPT = """
+  Generate an exam question for this course objective:
+  Objective: {objective}
+
+  Rules:
+  1. The question MUST be answerable using ONLY the provided material
+  2. Quote the specific passage that contains the answer (in "source_quote")
+  3. If you cannot find sufficient material, respond with {{"status": "insufficient"}}
+
+  Source material:
+  {chunks}
+
+  Respond in JSON:
+  {{
+      "question": "...",
+      "expected_answer_points": ["..."],
+      "source_quote": "exact quote from material that supports the answer",
+      "bloom_level": "remember|understand|apply|analyze",
+      "language": "sv|en"
+  }}
+  """ 
+# Temperature & Sampling Control
+
+  # For factual question generation — low temperature
+  question_gen_config = {
+      "temperature": 0.3,      # Low creativity, high faithfulness
+      "top_p": 0.9,
+      "repetition_penalty": 1.1
+  }
+
+  # For answer evaluation — even lower
+  evaluation_config = {
+      "temperature": 0.1,      # Near-deterministic for grading
+      "top_p": 0.85
+  }
+
+  # For adaptive suggestions — slightly higher
+  adaptive_config = {
+      "temperature": 0.5,      # Some creativity for pedagogical variety
+      "top_p": 0.9
+  }
