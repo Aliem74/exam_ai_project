@@ -1,0 +1,242 @@
+  import httpx
+  from bs4 import BeautifulSoup
+  from pathlib import Path
+  import fitz  # PyMuPDF
+  from dataclasses import dataclass, field
+  import re
+  from typing import Optional
+
+  @dataclass
+  class ExamQuestion:
+      course_code: str
+      year: str
+      question_number: int
+      question_text: str
+      marks: Optional[int] = None
+      model_answer: Optional[str] = None
+      topic_tags: list[str] = field(default_factory=list)
+      language: str = "en"
+      source_file: str = ""
+
+  @dataclass
+  class ExamDocument:
+      course_code: str
+      year: str
+      exam_type: str              # "tenta", "dugga", "omtenta"
+      file_url: str
+      questions: list[ExamQuestion] = field(default_factory=list)
+      has_solutions: bool = False
+      language: str = "en"
+
+
+  class ExamArchiveScraper:
+      """
+      Scrapes past exam papers from ftek.se and similar archives.
+
+      ftek.se typically has:
+      - PDF exam papers organized by course code
+      - Sometimes solutions/model answers
+      - Links organized by year and exam type
+      """
+
+      ARCHIVE_URLS = [
+          "https://ftek.se/tentor/",
+          "https://ftek.se/tentaarkiv/",
+          # Add more F-guild/section exam archives
+      ]
+
+      def __init__(self, download_dir: str = "./exam_cache"):
+          self.download_dir = Path(download_dir)
+          self.download_dir.mkdir(parents=True, exist_ok=True)
+          self.client = httpx.AsyncClient(
+              timeout=60.0,
+              headers={"User-Agent": "Mozilla/5.0 (Educational Research Bot)"},
+              follow_redirects=True
+          )
+
+      async def scrape_exams_for_course(self, course_code: str) -> list[ExamDocument]:
+          """Find and download all available exams for a course."""
+          exam_docs = []
+
+          for archive_url in self.ARCHIVE_URLS:
+              try:
+                  links = await self._find_exam_links(archive_url, course_code)
+                  for link in links:
+                      doc = await self._download_and_parse_exam(link, course_code)
+                      if doc:
+                          exam_docs.append(doc)
+              except httpx.HTTPError:
+                  continue  # Try next archive
+
+          return exam_docs
+
+      async def _find_exam_links(self, archive_url: str, course_code: str) -> list[dict]:
+          """Find PDF links for a specific course in the archive."""
+          response = await self.client.get(archive_url)
+          response.raise_for_status()
+          soup = BeautifulSoup(response.text, 'html.parser')
+
+          links = []
+          code_pattern = re.compile(re.escape(course_code), re.IGNORECASE)
+
+          for a_tag in soup.find_all('a', href=True):
+              href = a_tag['href']
+              link_text = a_tag.get_text(strip=True)
+
+              # Match course code in URL or link text
+              if code_pattern.search(href) or code_pattern.search(link_text):
+                  if href.endswith('.pdf') or 'pdf' in href.lower():
+                      full_url = href if href.startswith('http') else urljoin(archive_url, href)
+
+                      # Extract metadata from filename/link
+                      year = self._extract_year(href + link_text)
+                      exam_type = self._extract_exam_type(href + link_text)
+                      has_solutions = self._is_solution_file(href + link_text)
+
+                      links.append({
+                          "url": full_url,
+                          "year": year,
+                          "exam_type": exam_type,
+                          "has_solutions": has_solutions,
+                          "text": link_text
+                      })
+
+          return links
+
+      async def _download_and_parse_exam(
+          self, link_info: dict, course_code: str
+      ) -> Optional[ExamDocument]:
+          """Download a PDF and extract questions from it."""
+          url = link_info["url"]
+          filename = url.split('/')[-1]
+          local_path = self.download_dir / course_code / filename
+          local_path.parent.mkdir(parents=True, exist_ok=True)
+
+          # Download if not cached
+          if not local_path.exists():
+              response = await self.client.get(url)
+              response.raise_for_status()
+              local_path.write_bytes(response.content)
+
+          # Parse PDF
+          text = self._extract_pdf_text(local_path)
+          if not text:
+              return None
+
+          language = self._detect_language(text)
+          questions = self._parse_questions_from_text(text, course_code, link_info, language)
+
+          return ExamDocument(
+              course_code=course_code,
+              year=link_info["year"],
+              exam_type=link_info["exam_type"],
+              file_url=url,
+              questions=questions,
+              has_solutions=link_info["has_solutions"],
+              language=language
+          )
+
+      def _extract_pdf_text(self, path: Path) -> str:
+          """Extract text from a PDF file."""
+          try:
+              doc = fitz.open(str(path))
+              text = ""
+              for page in doc:
+                  text += page.get_text() + "\n\n"
+              doc.close()
+              return text
+          except Exception:
+              return ""
+
+      def _parse_questions_from_text(
+          self, text: str, course_code: str, link_info: dict, language: str
+      ) -> list[ExamQuestion]:
+          """Parse individual questions from exam text."""
+          questions = []
+
+          # Common patterns for question delimiters in Swedish/English exams
+          patterns = [
+              r'(?:Uppgift|Problem|Question|Fråga)\s*(\d+)',  # "Uppgift 1", "Problem 1"
+              r'^(\d+)\.\s+',                                   # "1. ..."
+              r'^(\d+)\s*[\)]\s+',                              # "1) ..."
+          ]
+
+          # Split text into question blocks
+          combined_pattern = '|'.join(f'({p})' for p in patterns)
+          splits = re.split(f'({combined_pattern})', text, flags=re.MULTILINE | re.IGNORECASE)
+
+          # Reconstruct questions from splits
+          current_q_num = 0
+          current_text = ""
+
+          for segment in splits:
+              if not segment:
+                  continue
+              # Check if this segment is a question header
+              match = re.match(patterns[0], segment, re.IGNORECASE)
+              if match:
+                  # Save previous question
+                  if current_text.strip() and current_q_num > 0:
+                      questions.append(ExamQuestion(
+                          course_code=course_code,
+                          year=link_info["year"],
+                          question_number=current_q_num,
+                          question_text=current_text.strip(),
+                          marks=self._extract_marks(current_text),
+                          language=language,
+                          source_file=link_info["url"]
+                      ))
+                  current_q_num = int(match.group(1))
+                  current_text = ""
+              else:
+                  current_text += segment
+
+          # Don't forget the last question
+          if current_text.strip() and current_q_num > 0:
+              questions.append(ExamQuestion(
+                  course_code=course_code,
+                  year=link_info["year"],
+                  question_number=current_q_num,
+                  question_text=current_text.strip(),
+                  marks=self._extract_marks(current_text),
+                  language=language,
+                  source_file=link_info["url"]
+              ))
+
+          return questions
+
+      def _extract_marks(self, text: str) -> Optional[int]:
+          """Extract point value from question text."""
+          match = re.search(r'[\(\[]?\s*(\d+)\s*(?:p|poäng|points|marks)\s*[\)\]]?', text, re.I)
+          return int(match.group(1)) if match else None
+
+      def _extract_year(self, text: str) -> str:
+          """Extract year from filename or link text."""
+          match = re.search(r'20[12]\d', text)
+          return match.group(0) if match else "unknown"
+
+      def _extract_exam_type(self, text: str) -> str:
+          """Classify exam type."""
+          text_lower = text.lower()
+          if any(w in text_lower for w in ['omtenta', 'resit', 'om-tenta']):
+              return "resit"
+          if any(w in text_lower for w in ['dugga', 'quiz', 'mid-term']):
+              return "midterm"
+          if any(w in text_lower for w in ['lösning', 'solution', 'facit', 'answer']):
+              return "solution"
+          return "exam"
+
+      def _is_solution_file(self, text: str) -> bool:
+          """Check if file is a solution/answer key."""
+          markers = ['lösning', 'solution', 'facit', 'answer', 'svar']
+          return any(m in text.lower() for m in markers)
+
+      def _detect_language(self, text: str) -> str:
+          """Detect language of exam text."""
+          swedish_words = ['uppgift', 'beräkna', 'förklara', 'lösning', 'poäng', 'tillåtna']
+          text_lower = text.lower()
+          swedish_count = sum(1 for w in swedish_words if w in text_lower)
+          return "sv" if swedish_count >= 2 else "en"
+
+      async def close(self):
+          await self.client.aclose()
